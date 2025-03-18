@@ -1,159 +1,294 @@
 import streamlit as st
-import requests
-import json
-from typing import List, Optional
+from langchain.llms import Ollama
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from langchain.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
-from langchain.schema import SystemMessage, HumanMessage, AIMessage
+from typing import List, Optional, Literal
+import re
+import json
 
-# ------------------------- Pydantic Response Models -------------------------
+# Define the data models using Pydantic
+class Intent(BaseModel):
+    intent_type: Literal["help", "info", "location", "faq", "goodbye", "unknown"] = Field(description="The type of intent detected in the user message")
+    confidence: float = Field(description="Confidence score between 0 and 1")
 
-class AddressResponse(BaseModel):
-    address: str = Field(..., description="The official address or location information.")
-    notes: Optional[str] = Field(None, description="Any additional notes about the address.")
+class UserInfo(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
 
-class FAQResponse(BaseModel):
-    answer: str = Field(..., description="The answer to the frequently asked question.")
-    related_topics: Optional[List[str]] = Field(None, description="List of related FAQ topics.")
+class Response(BaseModel):
+    message: str = Field(description="Response message to show to the user")
+    follow_up_question: Optional[str] = None
+    is_farewell: bool = False
 
-# ------------------------- Sample Knowledge Base -------------------------
+# Initialize Ollama with Llama 3.2 model
+def initialize_llm():
+    return Ollama(model="llama3.2")
 
-ADDRESS_KB = """
-Our main office is located at 1234 Elm Street, Springfield, USA.
-We are open from Monday to Friday, 9 AM to 5 PM.
-"""
+# General purpose agent
+def create_general_agent(llm):
+    template = """
+    You are a helpful general-purpose customer support assistant named ChatBot. Your job is to:
+    1. Greet users warmly
+    2. Collect basic user information (name and email)
+    3. Handle general queries
+    4. Route specific queries to specialized agents
+    5. Say goodbye politely
 
-FAQ_KB = """
-1. What is your return policy? You can return items within 30 days with a valid receipt.
-2. Do you ship internationally? Yes, we ship worldwide with additional shipping charges.
-"""
+    User message: {user_message}
+    Current user info: {user_info}
+    Conversation history: {conversation_history}
 
-# ------------------------- LangChain Style Agent Prompts -------------------------
+    Respond with a JSON object in the following format:
+    {{"message": "Your response to the user", "follow_up_question": "Optional follow-up question", "is_farewell": false}}
 
-AGENTS = {
-    "address": {
-        "system_prompt": "You are a customer support agent specialized in handling address and location-related queries. Use the knowledge base to give precise answers.",
-        "knowledge_base": ADDRESS_KB,
-        "response_model": AddressResponse
-    },
-    "faq": {
-        "system_prompt": "You are a customer support agent answering frequently asked questions (FAQ). Respond based on the provided knowledge base.",
-        "knowledge_base": FAQ_KB,
-        "response_model": FAQResponse
-    }
-}
+    If the user is saying goodbye, set "is_farewell" to true.
+    """
+    
+    prompt = PromptTemplate(
+        template=template,
+        input_variables=["user_message", "user_info", "conversation_history"]
+    )
+    
+    chain = LLMChain(llm=llm, prompt=prompt)
+    return chain
 
-# ------------------------- Intent Detection -------------------------
+# Intent recognition agent
+def create_intent_agent(llm):
+    template = """
+    You are an intent classification system. Given a user message, determine the most likely intent.
+    
+    User message: {user_message}
+    
+    Return a JSON object with the following format:
+    {{"intent_type": "<INTENT>", "confidence": <CONFIDENCE>}}
+    
+    Where <INTENT> is one of: "help", "info", "location", "faq", "goodbye", "unknown"
+    And <CONFIDENCE> is a number between 0 and 1 indicating your confidence.
+    
+    Important: Return ONLY the JSON object and nothing else.
+    """
+    
+    prompt = PromptTemplate(
+        template=template,
+        input_variables=["user_message"]
+    )
+    
+    chain = LLMChain(llm=llm, prompt=prompt)
+    return chain
 
-def detect_intent(message: str) -> str:
-    """Simple intent detection based on keywords (can be improved using AI classification)."""
-    address_keywords = ["address", "location", "where", "located"]
-    faq_keywords = ["return", "refund", "ship", "policy", "international"]
+# Location help agent
+def create_location_agent(llm):
+    template = """
+    You are a location assistance specialist. Your job is to help customers with location-related queries.
+    
+    User message: {user_message}
+    
+    Knowledge base:
+    - Our headquarters is at 123 Main Street, New York, NY 10001
+    - We have branches in Los Angeles, Chicago, Miami, and Seattle
+    - Our European office is in London at 45 Oxford Street
+    - All locations are open Monday-Friday 9am-5pm local time
+    - Visitors must check in at the front desk with photo ID
+    
+    Respond with a JSON object in the following format:
+    {{"message": "Your response to the user", "follow_up_question": "Optional follow-up question", "is_farewell": false}}
+    """
+    
+    prompt = PromptTemplate(
+        template=template,
+        input_variables=["user_message"]
+    )
+    
+    chain = LLMChain(llm=llm, prompt=prompt)
+    return chain
 
-    if any(word in message.lower() for word in address_keywords):
-        return "address"
-    elif any(word in message.lower() for word in faq_keywords):
-        return "faq"
-    else:
-        return "faq"  # Default fallback
+# FAQ agent
+def create_faq_agent(llm):
+    template = """
+    You are a FAQ specialist. Your job is to answer frequently asked questions about our products and services.
+    
+    User message: {user_message}
+    
+    Knowledge base:
+    - Our standard shipping takes 3-5 business days
+    - Express shipping is available for an additional $15
+    - Returns are accepted within 30 days with receipt
+    - Our warranty covers manufacturing defects for 1 year
+    - We accept all major credit cards and PayPal
+    - Customer service is available 24/7 via chat and 8am-8pm ET by phone
+    
+    Respond with a JSON object in the following format:
+    {{"message": "Your response to the user", "follow_up_question": "Optional follow-up question", "is_farewell": false}}
+    """
+    
+    prompt = PromptTemplate(
+        template=template,
+        input_variables=["user_message"]
+    )
+    
+    chain = LLMChain(llm=llm, prompt=prompt)
+    return chain
 
-# ------------------------- Query Ollama with LangChain System -------------------------
+# Email validation
+def is_valid_email(email):
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return re.match(pattern, email) is not None
 
-def query_ollama_langchain(message: str, agent_key: str, ollama_url, model_name, temperature, max_tokens):
-    agent = AGENTS[agent_key]
-    system_prompt = agent["system_prompt"] + "\n\nKnowledge Base:\n" + agent["knowledge_base"]
-
-    # Prepare chat messages in LangChain style
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": message}
-    ]
-
+# Parse JSON safely
+def parse_json_response(response_text):
     try:
-        response = requests.post(
-            ollama_url,
-            json={
-                "model": model_name,
-                "messages": messages,
-                "options": {
-                    "temperature": temperature,
-                    "num_predict": max_tokens
-                },
-                "stream": False
-            },
-            timeout=120
-        )
-        if response.status_code == 200:
-            return response.json()["message"]["content"]
-        else:
-            return f"Error: Received status code {response.status_code} from Ollama API."
-    except Exception as e:
-        return f"Error: {str(e)}"
+        # Find JSON object in the text
+        start_idx = response_text.find('{')
+        end_idx = response_text.rfind('}') + 1
+        
+        if start_idx >= 0 and end_idx > start_idx:
+            json_str = response_text[start_idx:end_idx]
+            return json.loads(json_str)
+        return {"message": response_text, "follow_up_question": None, "is_farewell": False}
+    except json.JSONDecodeError:
+        return {"message": response_text, "follow_up_question": None, "is_farewell": False}
 
-# ------------------------- Streamlit App Setup -------------------------
+# Parse intent JSON safely
+def parse_intent_response(response_text):
+    try:
+        # Find JSON object in the text
+        start_idx = response_text.find('{')
+        end_idx = response_text.rfind('}') + 1
+        
+        if start_idx >= 0 and end_idx > start_idx:
+            json_str = response_text[start_idx:end_idx]
+            result = json.loads(json_str)
+            return Intent(intent_type=result.get("intent_type", "unknown"), 
+                         confidence=float(result.get("confidence", 0.0)))
+        return Intent(intent_type="unknown", confidence=0.0)
+    except (json.JSONDecodeError, ValueError):
+        return Intent(intent_type="unknown", confidence=0.0)
 
-# Set page config
-st.set_page_config(page_title="Multi-Agent Customer Support", page_icon="🤖", layout="wide")
-st.title("Multi-Agent Customer Support 🤖")
-st.caption("Powered by Llama3.2 and Ollama - Dynamic Agent Routing")
+# Main Streamlit app
+def main():
+    st.title("Customer Support ChatBot")
+    
+    # Initialize session state variables
+    if "messages" not in st.session_state:
+        st.session_state.messages = [
+            {"role": "assistant", "content": "Hi there! Welcome to ChatBot. How can I help you today?"}
+        ]
+    
+    if "user_info" not in st.session_state:
+        st.session_state.user_info = UserInfo()
+    
+    if "current_agent" not in st.session_state:
+        st.session_state.current_agent = "general"
+    
+    if "llm" not in st.session_state:
+        with st.spinner("Initializing AI model..."):
+            st.session_state.llm = initialize_llm()
+            st.session_state.general_agent = create_general_agent(st.session_state.llm)
+            st.session_state.intent_agent = create_intent_agent(st.session_state.llm)
+            st.session_state.location_agent = create_location_agent(st.session_state.llm)
+            st.session_state.faq_agent = create_faq_agent(st.session_state.llm)
+    
+    # Display chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+    
+    # Process user input
+    if user_input := st.chat_input("Type your message here..."):
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.write(user_input)
+        
+        # Process the message
+        with st.spinner("Thinking..."):
+            # Check if we need to collect user info first
+            if not st.session_state.user_info.name:
+                st.session_state.user_info.name = user_input
+                response_text = f"Nice to meet you, {user_input}! Could you please provide your email address so I can better assist you?"
+                st.session_state.messages.append({"role": "assistant", "content": response_text})
+                with st.chat_message("assistant"):
+                    st.write(response_text)
+                return
+            
+            if not st.session_state.user_info.email:
+                if is_valid_email(user_input):
+                    st.session_state.user_info.email = user_input
+                    response_text = f"Thank you, {st.session_state.user_info.name}! How can I assist you today?"
+                    st.session_state.messages.append({"role": "assistant", "content": response_text})
+                    with st.chat_message("assistant"):
+                        st.write(response_text)
+                else:
+                    response_text = "That doesn't look like a valid email address. Could you please try again?"
+                    st.session_state.messages.append({"role": "assistant", "content": response_text})
+                    with st.chat_message("assistant"):
+                        st.write(response_text)
+                return
+            
+            # Get conversation history for context
+            conversation_history = "\n".join([f"{msg['role']}: {msg['content']}" 
+                                             for msg in st.session_state.messages[-5:]])
+            
+            # Determine intent for routing
+            intent_response = st.session_state.intent_agent.run(user_message=user_input)
+            intent = parse_intent_response(intent_response)
+            
+            # Route to appropriate agent based on intent or current agent
+            if intent.intent_type == "goodbye" or "goodbye" in user_input.lower():
+                st.session_state.current_agent = "general"
+                response = st.session_state.general_agent.run(
+                    user_message=user_input,
+                    user_info=st.session_state.user_info.dict(),
+                    conversation_history=conversation_history
+                )
+                response_data = parse_json_response(response)
+                response_data["is_farewell"] = True
+            elif intent.intent_type == "location" or st.session_state.current_agent == "location":
+                st.session_state.current_agent = "location"
+                response = st.session_state.location_agent.run(user_message=user_input)
+                response_data = parse_json_response(response)
+            elif intent.intent_type == "faq" or st.session_state.current_agent == "faq":
+                st.session_state.current_agent = "faq"
+                response = st.session_state.faq_agent.run(user_message=user_input)
+                response_data = parse_json_response(response)
+            else:
+                # Default to general agent
+                st.session_state.current_agent = "general"
+                response = st.session_state.general_agent.run(
+                    user_message=user_input,
+                    user_info=st.session_state.user_info.dict(),
+                    conversation_history=conversation_history
+                )
+                response_data = parse_json_response(response)
+            
+            # Add bot response to chat history
+            st.session_state.messages.append({"role": "assistant", "content": response_data["message"]})
+            with st.chat_message("assistant"):
+                st.write(response_data["message"])
+            
+            # Add follow-up question if provided
+            if response_data.get("follow_up_question"):
+                st.session_state.messages.append({"role": "assistant", "content": response_data["follow_up_question"]})
+                with st.chat_message("assistant"):
+                    st.write(response_data["follow_up_question"])
+            
+            # Check if this is a farewell
+            if response_data.get("is_farewell", False):
+                farewell_msg = "Thank you for chatting with us today! If you need help in the future, just come back. Goodbye!"
+                st.session_state.messages.append({"role": "assistant", "content": farewell_msg})
+                with st.chat_message("assistant"):
+                    st.write(farewell_msg)
+                
+                # Reset for a new conversation
+                if st.button("Start New Conversation"):
+                    st.session_state.messages = [
+                        {"role": "assistant", "content": "Hi there! Welcome to ChatBot. How can I help you today?"}
+                    ]
+                    st.session_state.user_info = UserInfo()
+                    st.session_state.current_agent = "general"
+                    st.experimental_rerun()
 
-# Session state for chat
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# Sidebar
-with st.sidebar:
-    st.header("Model Settings")
-    ollama_url = st.text_input("Ollama API URL", value="http://localhost:11434/api/chat")
-    model_name = st.selectbox("Model", ["llama3.2", "llama3.2:70b"], index=0)
-    temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1)
-    max_tokens = st.slider("Max Tokens", 64, 4096, 1024, 64)
-    st.divider()
-    if st.button("Clear Conversation"):
-        st.session_state.messages = []
-        st.rerun()
-
-# Display chat history
-for message in st.session_state.messages:
-    with st.container():
-        role = "👤" if message["role"] == "user" else "🤖"
-        st.markdown(f"""
-        <div class="chat-message {message['role']}">
-            <div class="avatar">{role}</div>
-            <div class="message">{message['content']}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-# Chat input
-user_input = st.chat_input("Type your message here...")
-
-# ------------------------- Main Chat Handling -------------------------
-
-if user_input:
-    # Append user message
-    st.session_state.messages.append({"role": "user", "content": user_input})
-
-    # Detect intent
-    intent = detect_intent(user_input)
-
-    # Query the selected agent
-    with st.spinner(f"Routing to {intent.capitalize()} agent..."):
-        response = query_ollama_langchain(
-            user_input, intent, ollama_url, model_name, temperature, max_tokens
-        )
-
-    # Append assistant message
-    st.session_state.messages.append({"role": "assistant", "content": response})
-
-    # Rerun to refresh chat UI
-    st.rerun()
-
-# ------------------------- Footer Instructions -------------------------
-
-st.divider()
-st.markdown("""
-### Instructions:
-1. Make sure Ollama is running locally and the Llama3.2 model is available.
-2. The chatbot dynamically routes queries to specialized agents based on intent.
-3. Adjust temperature and max tokens in the sidebar for better control over responses.
-4. Start by asking for an address or any FAQ like return policy.
-""")
+if __name__ == "__main__":
+    main()
